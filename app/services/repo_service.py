@@ -1,50 +1,70 @@
 import os
 import shutil
+import tempfile
 from git import Repo, GitCommandError
 
 def extract_code_from_repo(repo_url: str, user_id: str, week: int):
-    # 1. MOVE TEMP OUTSIDE: Use /tmp or a folder outside your project root
-    # This prevents Uvicorn from restarting when it detects the cloned files
-    parent_dir = os.path.dirname(os.path.dirname(os.getcwd())) # Goes 2 levels up
-    local_path = os.path.join(parent_dir, f"bluepeak_temp/sub_{user_id}_wk{week}")
+    """
+    Clones a GitHub repo into a temp directory, extracts technical files,
+    and cleans up immediately to save cloud disk space.
+    """
+    # 1. Use tempfile to ensure a unique, writable path in Render's /tmp folder
+    temp_dir = tempfile.mkdtemp(prefix=f"bp_sub_{user_id}_wk{week}_")
     
-    if os.path.exists(local_path):
-        shutil.rmtree(local_path, ignore_errors=True)
-
     try:
-        Repo.clone_from(repo_url, local_path, depth=1)
+        # 2. Clone with depth=1 (shallow clone) to save time and bandwidth
+        Repo.clone_from(repo_url, temp_dir, depth=1)
         
         extracted_content = []
-        # Keep this list tight to save tokens
-        allowed_extensions = ('.py', '.sql', '.js') 
-        ignore_dirs = {'.git', 'node_modules', 'tests', 'venv', 'goldens', 'samples'}
+        # technical files allowed for review
+        allowed_extensions = ('.py', '.js', '.ts', '.tsx', '.sql', '.md', '.json') 
+        # folders to skip to avoid token bloat and irrelevant data
+        ignore_dirs = {'.git', 'node_modules', 'tests', 'venv', 'env', '__pycache__'}
 
         token_count_approx = 0
-        max_tokens = 100000 # Safety cap (well under 250k)
+        max_tokens_cap = 80000  # Conservative cap for Gemini prompt context
 
-        for root, dirs, files in os.walk(local_path):
+        # 3. Walk through the directory
+        for root, dirs, files in os.walk(temp_dir):
+            # Prune ignored directories in-place
             dirs[:] = [d for d in dirs if d not in ignore_dirs]
             
             for file in files:
-                # ONLY take root files or small files to start
                 if file.endswith(allowed_extensions):
                     file_path = os.path.join(root, file)
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        # Simple check: Don't send massive files
-                        if len(content) > 10000: continue 
-                        
-                        extracted_content.append(f"--- FILE: {file} ---\n{content}\n")
-                        token_count_approx += len(content) // 4
+                    
+                    try:
+                        # Open with ignore to prevent crashing on binary or weird encodings
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            
+                            # Skip massive files (e.g., package-lock.json or data dumps)
+                            if len(content) > 15000:
+                                continue
+                            
+                            relative_path = os.path.relpath(file_path, temp_dir)
+                            extracted_content.append(f"--- File: {relative_path} ---\n{content}\n")
+                            
+                            # Approximate tokens (4 chars per token)
+                            token_count_approx += len(content) // 4
+                            
+                    except Exception as file_err:
+                        print(f"Skipping {file}: {file_err}")
+                        continue
                 
-                if token_count_approx > max_tokens:
+                # Stop if we hit the token safety limit
+                if token_count_approx > max_tokens_cap:
                     break
+        
+        return "\n".join(extracted_content) if extracted_content else None
 
-        return "\n".join(extracted_content)
-
+    except GitCommandError as git_err:
+        print(f"Git Clone Error: {git_err}")
+        return None
     except Exception as e:
-        print(f"Extraction Error: {e}")
+        print(f"General Extraction Error: {e}")
         return None
     finally:
-        if os.path.exists(local_path):
-            shutil.rmtree(local_path, ignore_errors=True)
+        # 4. CRITICAL: Clean up the folder after extraction to save disk space on Render
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
