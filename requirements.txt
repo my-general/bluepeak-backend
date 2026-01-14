@@ -1,9 +1,9 @@
 fastapi
 uvicorn[standard]
 python-multipart
-flask-cors
 supabase
 google-genai
 pydantic
 razorpay
 python-dotenv
+GitPython
